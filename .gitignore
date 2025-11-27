@@ -2,3 +2,34 @@
 .Rhistory
 .RData
 .Ruserdata
+
+
+# Ignore datasets
+data/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.rds
+*.RData
+*.parquet
+
+# Ignore output files
+*.html
+*.pdf
+*.docx
+
+# Ignore local environment files
+.Rhistory
+.RData
+.Rproj.user/
+.Rprofile
+
+# Ignore large files and caches
+*.zip
+*.tar
+*.gz
+
+# OS-specific ignores
+.DS_Store
+Thumbs.db
