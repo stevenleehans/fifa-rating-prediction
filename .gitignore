@@ -15,7 +15,7 @@ data/
 *.parquet
 
 # Ignore output files
-*.html
+
 *.pdf
 *.docx
 
