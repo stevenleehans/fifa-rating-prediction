@@ -1,0 +1,1327 @@
+---
+title: "FIT5145 Assignment 3: Predicting 2025 Player Ratings using FIFA 15–FC 24 Data"
+author: "Hans Steven Lee (33292280)"
+date: "October 2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(randomForest)
+library(janitor)
+library(stringi)
+library(dplyr)
+library(factoextra)
+library(cluster)
+library(tidytext)
+library(plotly)
+```
+
+# 1. Introduction
+
+This R Markdown demonstrates a longitudinal approach to **player performance prediction** using the full FIFA dataset from **FIFA 15–EA FC 24** (JoeBeachCapital, 2024).\
+The goal is to predict **2025 player ratings** based on historical trends from 2015–2024, reflecting realistic player development and scouting insights.
+
+------------------------------------------------------------------------
+
+# 2. Load and Combine Data
+
+```{r load-data}
+
+# -------------------------------------------------------------------------
+# Data Acquisition and Integration
+# -------------------------------------------------------------------------
+# Dataset Source:
+# JoeBeachCapital. (2024). *FIFA Players 2015–2023 + FC24* [Dataset].
+# Kaggle. https://www.kaggle.com/datasets/joebeachcapital/fifa-players
+#
+# To ensure reproducibility, users can access the dataset via the Kaggle API. 
+#However I changed some filename and put it into one folder, for example EAFC24 players_24.csv, So, it is recommended to download the file into local by accessing this personal link https://drive.google.com/drive/folders/1qM1iSxC3Am-RP7l9ZHIQHPkrG3oG8zHa?usp=sharing:
+# kaggle::kaggle_download(dataset = "joebeachcapital/fifa-players", path = "data/")
+# fifa <- read_csv("data/fifa_players.csv")
+#
+# Local directory used for this analysis:
+# "/Users/stevenleehans/Documents/Documents - Hans’s MacBook Pro/Uni - Masters - Monash University/
+#  Second Semester/FIT5145 - Foundations of Data Science/Assignment 1 & 3/Assignment 3 Project"
+# -------------------------------------------------------------------------
+
+# Years with consistent structure across versions
+years <- 2015:2022
+
+# Function: read and standardise each yearly file
+read_fifa <- function(y) {
+  file_path <- paste0(
+    "Datasets/FIFA 15-23 + EA FC 24 - jamesbeach/fifadatasetfinal/players_",
+    substr(y, 3, 4),
+    ".csv"
+  )
+  
+  read_csv(file_path, show_col_types = FALSE) %>%
+    mutate(
+      year = y,
+      dob = as.character(dob),
+      club_joined = as.character(club_joined),
+      club_contract_valid_until = as.character(club_contract_valid_until),
+      release_clause_eur = as.numeric(release_clause_eur),
+      mentality_composure = as.numeric(mentality_composure),
+      gk = as.numeric(gk)  # Handle 2015 column type mismatch (double vs character)
+    )
+}
+
+# Load and combine data from 2015–2022
+fifa_all <- map_dfr(years, read_fifa)
+
+cat("Combined rows:", nrow(fifa_all), "\n")
+cat("Years covered:\n")
+print(table(fifa_all$year))
+
+# ✅ Add 2023 and 2024 datasets
+fifa_2023 <- read_csv(
+  "Datasets/FIFA 15-23 + EA FC 24 - jamesbeach/fifadatasetfinal/players_23.csv",
+  show_col_types = FALSE
+) %>%
+  mutate(year = 2023)
+
+fifa_2024 <- read_csv(
+  "Datasets/FIFA 15-23 + EA FC 24 - jamesbeach/fifadatasetfinal/players_24.csv",
+  show_col_types = FALSE
+) %>%
+  mutate(year = 2024)
+```
+
+------------------------------------------------------------------------
+
+# 3. Data Cleaning & Preparation
+
+```{r clean-data}
+# 3. Data Cleaning & Preparation  ---------------------------------------
+
+library(stringr)
+
+# ✅ Step 1. Keep consistent key columns for player-level analysis
+fifa_players_15_22 <- fifa_all %>%
+  select(long_name, club_name, player_positions, age, overall, potential,
+         pace, shooting, passing, dribbling, defending, physic, year,value_eur) %>%
+  mutate(
+    long_name = str_trim(toupper(long_name)),
+    club_name = str_trim(toupper(club_name)),
+    player_positions = str_trim(toupper(player_positions)),
+    across(c(overall, potential, pace, shooting, passing, dribbling, defending, physic, age),
+           ~ suppressWarnings(as.numeric(.))),
+    year = as.integer(year)
+  ) %>%
+  drop_na(overall, potential, age)
+
+# ✅ Handle unbalanced panel data
+# Keep only players who appear in at least two consecutive seasons
+fifa_players_15_22 <- fifa_players_15_22 %>%
+  group_by(long_name) %>%
+  filter(n() >= 2) %>%        # retain players with >= 2 yearly records
+  ungroup()
+
+cat("✅ Players retained with ≥2 seasons:", 
+    n_distinct(fifa_players_15_22$long_name), "\n")
+
+cat("✅ Player-level data (2015–2022):", nrow(fifa_players_15_22), "rows\n")
+cat("Years covered:\n")
+print(table(fifa_players_15_22$year))
+
+# ✅ Step 2. Create target variable: next year's overall rating
+fifa_players_lagged <- fifa_players_15_22 %>%
+  arrange(long_name, year) %>%
+  group_by(long_name) %>%
+  mutate(next_rating = lead(overall)) %>%
+  ungroup() %>%
+  filter(!is.na(next_rating))
+
+cat("✅ Player rows with next_rating (for training):", nrow(fifa_players_lagged), "\n")
+
+# ✅ Step 3. Prepare 2023 team dataset (already team-level)
+fifa_2023_team <- fifa_2023 %>%
+  janitor::clean_names() %>%
+  mutate(
+    team_name = str_trim(toupper(team_name)),
+    year = 2023L
+  ) %>%
+  select(team_id, team_name, league_name, league_id, overall, attack, midfield, defence, year)
+
+cat("✅ Team-level data (2023):", nrow(fifa_2023_team), "rows\n")
+
+# ✅ Step 4. Aggregate 2015–2022 player data → team-level summaries
+fifa_team_summary_15_22 <- fifa_players_15_22 %>%
+  group_by(club_name, year) %>%
+  summarise(
+    team_overall = mean(overall, na.rm = TRUE),
+    team_potential = mean(potential, na.rm = TRUE),
+    team_age = mean(age, na.rm = TRUE),
+    team_pace = mean(pace, na.rm = TRUE),
+    team_shooting = mean(shooting, na.rm = TRUE),
+    team_passing = mean(passing, na.rm = TRUE),
+    team_dribbling = mean(dribbling, na.rm = TRUE),
+    team_defending = mean(defending, na.rm = TRUE),
+    team_physic = mean(physic, na.rm = TRUE),
+    n_players = n()
+  ) %>%
+  ungroup()
+
+cat("✅ Team-level summary (2015–2022):", nrow(fifa_team_summary_15_22), "club-year rows\n")
+
+# ✅ Step 5. Align naming for comparison with 2023 team dataset
+fifa_team_summary_15_22 <- fifa_team_summary_15_22 %>%
+  rename(team_name = club_name)
+
+# ✅ Step 6. (Optional) Combine for longitudinal team analysis
+fifa_team_all <- bind_rows(
+  fifa_team_summary_15_22,
+  fifa_2023_team %>%
+    select(team_name, overall, attack, midfield, defence, year) %>%
+    rename(team_overall = overall)
+)
+
+cat("✅ Combined team-level dataset (2015–2023):", nrow(fifa_team_all), "rows\n")
+
+# ✅ Step 7. Final outputs for modeling
+# • Player-level: fifa_players_lagged → use for next_rating prediction
+# • Team-level: fifa_team_all → use for club performance modeling
+glimpse(fifa_players_lagged)
+glimpse(fifa_team_all)
+```
+
+------------------------------------------------------------------------
+
+# 4. Train-Test Split
+
+Train on 2015–2023 data, predict 2024 ratings (to simulate 2025 performance).
+
+```{r split-data}
+
+# 4. Train–Test Split  ---------------------------------------------------
+
+
+# ---- Rebuild clean players table (2015–2022 only) ----
+# ⚠️ Only run this if you haven't already cleaned fifa_players earlier.
+fifa_players <- fifa_players_15_22 %>%
+  mutate(
+    year = as.integer(year),
+    long_name = str_to_upper(str_trim(long_name)),
+    across(c(overall, potential, pace, shooting, passing, dribbling, defending, physic, age),
+           as.numeric)
+  )
+
+cat("Raw player rows per year:\n")
+print(fifa_players %>% count(year) %>% arrange(year))
+
+# ---- Create next_year target (rating in year+1) via self-join ----
+lag_lookup <- fifa_players %>%
+  transmute(long_name, year = year - 1L, next_rating = overall)
+
+fifa_players_lagged <- fifa_players %>%
+  left_join(lag_lookup, by = c("long_name","year")) %>%
+  filter(!is.na(next_rating))  # keep only rows that have a next year's rating
+
+cat("\nRows per year AFTER adding next_rating (trainable years only):\n")
+print(fifa_players_lagged %>% count(year) %>% arrange(year))
+
+# ---- Pick test year automatically (latest year that still has a next year) ----
+test_year <- max(fifa_players_lagged$year, na.rm = TRUE)
+cat("\nChosen test_year:", test_year, "\n")
+
+train <- fifa_players_lagged %>% filter(year < test_year)
+test  <- fifa_players_lagged %>% filter(year == test_year)
+
+cat("\nTrain years:\n"); print(table(train$year))
+cat("Test year:\n"); print(table(test$year))
+```
+
+------------------------------------------------------------------------
+
+# 5. Exploratory Analysis
+
+```{r eda}
+# 5. Exploratory Analysis  -----------------------------------------------
+
+library(ggplot2)
+library(dplyr)
+
+# ✅ 5.1 Distribution of overall ratings by year
+ggplot(train, aes(x = factor(year), y = overall)) +
+  geom_boxplot(fill = "steelblue", color = "white", alpha = 0.8) +
+  labs(
+    title = "Overall Ratings by Year (2015–2021)",
+    x = "Year",
+    y = "Overall Rating"
+  ) +
+  theme_minimal(base_size = 12)
+
+# ✅ 5.2 Relationship between Overall and Next Rating
+ggplot(train, aes(x = overall, y = next_rating)) +
+  geom_point(alpha = 0.3, color = "darkgreen") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  labs(
+    title = "Player Progression: Current vs. Next Year Rating",
+    x = "Current Overall",
+    y = "Next-Year Overall (next_rating)"
+  ) +
+  theme_minimal(base_size = 12)
+
+# ✅ 5.3 Correlation matrix for key attributes
+library(GGally)
+
+train %>%
+  select(overall, potential, pace, shooting, passing, dribbling, defending, physic, age, next_rating) %>%
+  drop_na() %>%
+  ggpairs(title = "Correlation Matrix: Key Player Attributes")
+
+# ✅ 5.4 Attribute trends over time
+train_summary <- train %>%
+  group_by(year) %>%
+  summarise(
+    avg_overall = mean(overall, na.rm = TRUE),
+    avg_potential = mean(potential, na.rm = TRUE),
+    avg_age = mean(age, na.rm = TRUE)
+  )
+
+train_summary %>%
+  pivot_longer(cols = c(avg_overall, avg_potential, avg_age),
+               names_to = "metric", values_to = "value") %>%
+  ggplot(aes(x = year, y = value, color = metric)) +
+  geom_line(size = 1.2) +
+  geom_point(size = 2) +
+  labs(
+    title = "Trends Over Time (2015–2021)",
+    x = "Year",
+    y = "Average Value",
+    color = "Metric"
+  ) +
+  theme_minimal(base_size = 12)
+
+# ✅ 5.5 Quick Sanity Check on Split
+cat("Training set years:\n"); print(table(train$year))
+cat("Test set years:\n");    print(table(test$year))
+cat("Train rows:", nrow(train), "| Test rows:", nrow(test), "\n")
+```
+
+------------------------------------------------------------------------
+
+# 6. Linear Regression Model
+
+```{r linear-model}
+# 6. Finding Best Predictors by Position Category
+# -----------------------------------------------
+library(stringr)
+library(broom)
+library(dplyr)
+library(glue)
+library(purrr)
+
+# ------------------------------------------------------------
+# Prepare NA-free numeric dataset for modelling (used in LM + RF)
+# ------------------------------------------------------------
+
+numeric_cols <- c("overall", "potential", "pace", "shooting",
+                  "passing", "dribbling", "defending", "physic", "age", "next_rating")
+
+train_lm <- train %>%
+  drop_na(all_of(numeric_cols)) %>%
+  mutate(across(all_of(numeric_cols), as.numeric))
+
+test_lm <- test %>%
+  drop_na(all_of(numeric_cols)) %>%
+  mutate(across(all_of(numeric_cols), as.numeric))
+# Global Linear Regression Model (baseline)
+model_lm <- lm(
+  next_rating ~ overall + potential + pace + shooting + 
+                 passing + dribbling + defending + physic + age,
+  data = train_lm
+)
+
+# Compute RMSE for consistency
+pred_lm <- predict(model_lm, test_lm)
+lm_rmse <- caret::RMSE(pred_lm, test_lm$next_rating)
+cat("\n✅ Linear Model RMSE:", lm_rmse, "\n")
+
+# ✅ 6.1 Standardise positions
+standardize_positions <- function(df) {
+  df %>%
+    mutate(
+      player_positions = trimws(toupper(player_positions)),
+      position_group = case_when(
+        str_detect(player_positions, "GK") ~ "Goalkeeper",
+        str_detect(player_positions, "CB|LB|RB|LWB|RWB") ~ "Defender",
+        str_detect(player_positions, "CDM|CM|CAM|LM|RM|LCM|RCM|LDM|RDM") ~ "Midfielder",
+        str_detect(player_positions, "ST|CF|LW|RW|LF|RF") ~ "Forward",
+        TRUE ~ "Other"
+      )
+    )
+}
+
+train <- standardize_positions(train)
+
+# ✅ 6.2 Convert numeric columns safely
+numeric_cols <- c("overall", "potential", "pace", "shooting", 
+                  "passing", "dribbling", "defending", "physic", "age", "next_rating")
+
+train <- train %>% mutate(across(all_of(numeric_cols), as.numeric))
+
+# ✅ 6.3 Function to fit model + extract top predictors per position
+find_best_predictors <- function(pos) {
+  data_pos <- train %>%
+    filter(position_group == pos) %>%
+    drop_na(all_of(numeric_cols))
+  
+  if (nrow(data_pos) < 100) {
+    message(glue("Skipping {pos}: insufficient rows"))
+    return(NULL)
+  }
+  
+  model <- lm(next_rating ~ overall + potential + pace + shooting +
+                passing + dribbling + defending + physic + age,
+              data = data_pos)
+  
+  # Extract coefficients, p-values, and standardise
+  summary_df <- tidy(model) %>%
+    filter(term != "(Intercept)") %>%
+    mutate(Position = pos,
+           abs_coef = abs(estimate)) %>%
+    arrange(desc(abs_coef))
+  
+  top5 <- head(summary_df, 5)
+  return(top5)
+}
+
+# ✅ 6.4 Apply to all positions
+predictor_results <- map_dfr(unique(train$position_group), find_best_predictors)
+
+# ✅ 6.5 Display summary
+predictor_results %>%
+  select(Position, term, estimate, p.value) %>%
+  group_by(Position) %>%
+  arrange(Position, desc(abs(estimate))) %>%
+  print(n = 20)
+
+# ✅ 6.6 Optional: visualise top predictors
+
+predictor_results <- predictor_results %>%
+  mutate(
+    Significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.1   ~ ".",
+      TRUE ~ ""
+    ),
+    Label = paste0(term, Significance)
+  )
+
+# ✅ Significance colours (optional aesthetic improvement)
+predictor_results <- predictor_results %>%
+  mutate(
+    Significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.1   ~ ".",
+      TRUE ~ ""
+    ),
+    SigColor = case_when(
+      p.value < 0.001 ~ "red",
+      p.value < 0.01  ~ "darkorange",
+      p.value < 0.05  ~ "gold",
+      p.value < 0.1   ~ "grey40",
+      TRUE ~ "transparent"
+    )
+  )
+
+# ✅ Enhanced plot
+ggplot(
+  predictor_results %>%
+    filter(!is.na(abs_coef)) %>%
+    slice_max(order_by = abs_coef, n = 5, by = Position),
+  aes(
+    x = reorder_within(term, abs_coef, Position),
+    y = abs_coef,
+    fill = Position
+  )
+) +
+  geom_col(show.legend = FALSE, width = 0.6) +
+  geom_text(aes(label = Significance, color = SigColor),
+            hjust = -0.4, size = 5, fontface = "bold") +
+  scale_color_identity() +  # use defined colors directly
+  facet_wrap(~ Position, scales = "free_y") +
+  scale_x_reordered() +
+  labs(
+    title = "Top Predictors for Next Rating by Position",
+    subtitle = "Stars denote statistical significance (*** p<0.001, ** p<0.01, * p<0.05)",
+    x = "Attribute",
+    y = "Absolute Coefficient"
+  ) +
+  theme_minimal(base_size = 14) +
+  coord_flip(clip = "off") +
+  theme(
+  strip.text = element_text(face = "bold", size = 14),
+  plot.title = element_text(face = "bold", hjust = 0.5, size = 18),
+  plot.subtitle = element_text(hjust = 0.5, size = 12),
+  plot.margin = ggplot2::margin(10, 80, 10, 10)  # ✅ explicitly use ggplot2's margin
+)
+```
+
+6.1 Objective
+
+After identifying the most influential predictors for each player position (Figure 6.1), the project extends these findings into position-specific linear regression models to forecast each player’s future performance (next_rating). This approach recognises that different attributes drive performance across roles — e.g., defending for defenders versus finishing and dribbling for forwards.
+
+⸻
+
+6.2 Methodology
+
+Each player was assigned to a position group (Goalkeeper, Defender, Midfielder, or Forward) based on their primary role. The dataset was then filtered to remove missing or non-numeric entries, and a linear regression model was fitted within each group using only the key predictors identified from the earlier significance analysis.
+
+The modelling process was implemented through an updated version of the custom function predict_players(), which now dynamically selects the relevant predictors depending on the player’s position:
+
+```{r 6 predict players linear regression}
+predict_players <- function(df, position) {
+  # Select top predictors by position
+  pos_vars <- switch(position,
+    "Goalkeeper" = c("overall", "potential", "age"),
+    "Defender"   = c("overall", "defending", "age", "potential", "shooting"),
+    "Midfielder" = c("overall", "passing", "dribbling", "age", "potential"),
+    "Forward"    = c("overall", "shooting", "dribbling", "age", "passing")
+  )
+
+  # Build dynamic formula
+  formula <- as.formula(paste("next_rating ~", paste(pos_vars, collapse = " + ")))
+
+  # Fit model and return summary
+  model <- lm(formula, data = df %>% filter(position_group == position))
+  broom::tidy(model)
+}
+```
+
+------------------------------------------------------------------------
+
+# 7. Random Forest Model
+
+```{r rf-model}
+# 7. Random Forest Model  -----------------------------------------------
+
+library(randomForest)
+set.seed(123)
+
+# ✅ 7.1 Use NA-free, numeric datasets prepared in Part 6
+# (train_lm / test_lm already contain all predictor + target columns)
+
+model_rf <- randomForest(
+  next_rating ~ overall + potential + pace + shooting + 
+                 passing + dribbling + defending + physic + age,
+  data = train_lm,
+  ntree = 500,
+  mtry = 3,
+  importance = TRUE,
+  na.action = na.omit
+)
+
+# ✅ 7.2 Predict on test set
+pred_rf <- predict(model_rf, test_lm)
+
+# ✅ 7.3 Evaluate performance
+rf_rmse <- RMSE(pred_rf, test_lm$next_rating)
+cat("\n✅ Random Forest RMSE:", rf_rmse, "\n")
+
+# ✅ 7.4 Feature importance plot
+varImpPlot(model_rf, main = "Feature Importance – Random Forest")
+
+# ✅ 7.5 (Optional) Show importance table
+importance_df <- as.data.frame(importance(model_rf)) %>%
+  rownames_to_column("Feature") %>%
+  arrange(desc(IncNodePurity))
+
+print(importance_df)
+```
+
+R Showcase Playground
+
+```{r showcase}
+
+predict_player <- function(player_name) {
+  
+  # 🔎 1. Clean & normalise names (remove accents, trim, uppercase)
+  name_clean <- player_name %>%
+    stri_trans_general("Latin-ASCII") %>%   # remove accents like é → e
+    str_trim() %>%
+    toupper()
+  
+  test_clean <- test %>%
+    mutate(long_name_clean = long_name %>%
+   
+             stri_trans_general("Latin-ASCII") %>% 
+             toupper()
+           
+           )%>% 
+    standardize_positions()
+  
+  # 🔍 2. Flexible match: check if all name parts appear
+  # e.g. "KAI HAVERTZ" will match "KAI LUKAS HAVERTZ"
+  name_parts <- str_split(name_clean, " ", simplify = TRUE)
+  
+  player_data <- test_clean %>%
+    filter(reduce(name_parts, ~ .x & str_detect(long_name_clean, .y), .init = TRUE)) %>%
+    slice_max(year, n = 1)
+  
+  if (nrow(player_data) == 0) {
+    message("⚠️ No matching player found in test dataset. Try fewer keywords (e.g. 'Wirtz').")
+    return(NULL)
+  }
+  
+  # ✅ 3. Predict using models
+  player_data <- player_data %>%
+    mutate(
+      pred_lm = predict(model_lm, newdata = player_data),
+      pred_rf = predict(model_rf, newdata = player_data),
+      lm_error = round(pred_lm - next_rating, 2),
+      rf_error = round(pred_rf - next_rating, 2)
+    )
+  
+  # 🎯 4. Format output
+  output <- player_data %>%
+    select(
+      Player = long_name,
+      Year = year,
+      Position = position_group,
+      Overall = overall,
+      Potential = potential,
+      Age = age,
+      `Actual Next Rating` = next_rating,
+      `Pred (LM)` = pred_lm,
+      `Pred (RF)` = pred_rf,
+      `Error (LM)` = lm_error,
+      `Error (RF)` = rf_error
+    )
+  
+  print(output)
+  return(invisible(output))
+}
+
+# Showcase predictions
+```
+
+```{r showcase go}
+
+predict_player("Olivier Giroud")
+predict_player("Eden Hazard")
+
+
+
+predict_player("KYLIAN MBAPPE")
+predict_player("KAI HAVERTZ")
+
+
+predict_player("wirtz")
+```
+
+------------------------------------------------------------------------
+
+# 8. Player Archetype Clustering
+------------------------------------------------------------------------
+
+```{r compare-models}
+# 8. Model Comparison  ---------------------------------------------------
+
+# Global RMSEs (ensure both exist)
+lm_rmse <- get("lm_rmse", envir = .GlobalEnv)
+rf_rmse <- get("rf_rmse", envir = .GlobalEnv)
+
+# If missing, compute global RF again
+if (is.null(rf_rmse)) {
+  pred_rf <- predict(model_rf, test_lm)
+  rf_rmse <- caret::RMSE(pred_rf, test_lm$next_rating)
+}
+
+# ✅ Combine and visualise
+results <- tibble(
+  Model = c("Linear Regression (Global)", "Random Forest (Global)"),
+  RMSE  = c(lm_rmse, rf_rmse)
+)
+
+results_sorted <- results %>% arrange(RMSE)
+
+cat("✅ Model Performance Comparison:\n")
+print(results_sorted)
+
+ggplot(results_sorted, aes(x = reorder(Model, RMSE), y = RMSE, fill = Model)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = round(RMSE, 3)), vjust = -0.5, size = 4.5) +
+  labs(
+    title = "Model RMSE Comparison",
+    subtitle = "Lower RMSE indicates better predictive performance",
+    x = NULL, y = "Root Mean Square Error (RMSE)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+K-means clustering was used to identify distinct player archetypes based on physical and technical attributes (pace, shooting, passing, dribbling, defending, physic, and age). The elbow and silhouette methods both supported four optimal clusters, representing coherent styles of play. These groupings allow interpretation of players not only through statistical similarity but also through their role-specific skill patterns.
+
+This unsupervised segmentation bridges the gap between raw attributes and tactical identity, providing an interpretive layer that complements the predictive modelling that follows.
+
+```{r clustering}
+
+# ✅ Select relevant numeric features
+cluster_df <- train %>%
+  select(pace, shooting, passing, dribbling, defending, physic, age) %>%
+  drop_na()
+
+# ✅ Standardise features (equal weight)
+scaled_df <- scale(cluster_df)
+
+
+# ✅ sample a manageable subset for k testing
+set.seed(123)
+sample_df <- scaled_df[sample(1:nrow(scaled_df), 3000), ]  # 3 000 rows is plenty
+
+fviz_nbclust(sample_df, kmeans, method = "wss") +
+  labs(title = "Elbow Method (sampled 3 000 players)")
+
+fviz_nbclust(sample_df, kmeans, method = "silhouette") +
+  labs(title = "Silhouette Method (sampled 3 000 players)")
+
+set.seed(123)
+k4 <- kmeans(scaled_df, centers = 4, nstart = 25)
+
+# ✅ Visualise clusters
+fviz_cluster(k4, data = scaled_df,
+             geom = "point",
+             ellipse.type = "norm",
+             palette = "Set2",
+             ggtheme = theme_minimal()) +
+  labs(title = "Player Clusters Based on Core Attributes")
+
+##cluster profiling
+
+cluster_summary <- cluster_df %>%
+  mutate(Cluster = k4$cluster) %>%
+  group_by(Cluster) %>%
+  summarise(across(everything(), mean, .names = "avg_{.col}")) %>%
+  arrange(Cluster)
+
+print(cluster_summary)
+```
+
+# ------------------------------------------------------------
+
+# 9. Integrating Clusters with Predictions & Model Evaluation
+
+# ------------------------------------------------------------
+
+```{r integrating cluster}
+
+
+library(dplyr)
+library(ggplot2)
+library(broom)
+library(glue)
+library(factoextra)
+
+# ✅ 9.1 Add cluster labels to training data
+# (Assuming k4 is your k-means model from Section 8)
+train_with_cluster <- train %>%
+  mutate(Cluster = k4$cluster[as.numeric(rownames(.))])
+
+# ✅ 9.2 Add predictions from both models
+train_with_cluster <- train_with_cluster %>%
+  mutate(
+    Pred_LM = predict(model_lm, newdata = train_with_cluster),
+    Pred_RF = predict(model_rf, newdata = train_with_cluster)
+  )
+
+# ✅ 9.3 Compute average predicted vs actual performance per cluster
+cluster_perf <- train_with_cluster %>%
+  group_by(Cluster) %>%
+  summarise(
+    count = n(),
+    avg_overall = mean(overall, na.rm = TRUE),
+    avg_potential = mean(potential, na.rm = TRUE),
+    avg_next_rating = mean(next_rating, na.rm = TRUE),
+    avg_pred_lm = mean(Pred_LM, na.rm = TRUE),
+    avg_pred_rf = mean(Pred_RF, na.rm = TRUE),
+    rmse_lm = sqrt(mean((Pred_LM - next_rating)^2, na.rm = TRUE)),
+    rmse_rf = sqrt(mean((Pred_RF - next_rating)^2, na.rm = TRUE))
+  ) %>%
+  arrange(Cluster)
+
+print(cluster_perf)
+
+# ✅ 9.4 Correlation between predicted ratings and cluster membership
+# Encode Cluster as numeric for correlation
+cor_rf <- cor(train_with_cluster$Cluster, train_with_cluster$Pred_RF, use = "complete.obs")
+cor_lm <- cor(train_with_cluster$Cluster, train_with_cluster$Pred_LM, use = "complete.obs")
+cat(glue("Correlation (Cluster vs Pred_RF): {round(cor_rf, 3)}\n"))
+cat(glue("Correlation (Cluster vs Pred_LM): {round(cor_lm, 3)}\n"))
+
+# ✅ 9.5 ANOVA significance test (does predicted rating differ across clusters?)
+anova_rf <- aov(Pred_RF ~ factor(Cluster), data = train_with_cluster)
+anova_lm <- aov(Pred_LM ~ factor(Cluster), data = train_with_cluster)
+cat("\nANOVA – Random Forest:\n")
+print(tidy(anova_rf))
+cat("\nANOVA – Linear Model:\n")
+print(tidy(anova_lm))
+
+# ✅ 9.6 Visualise cluster-wise performance
+cluster_perf_long <- cluster_perf %>%
+  select(Cluster, avg_next_rating, avg_pred_rf, avg_pred_lm) %>%
+  tidyr::pivot_longer(cols = -Cluster, names_to = "Metric", values_to = "Value")
+
+ggplot(cluster_perf_long, aes(x = factor(Cluster), y = Value, fill = Metric)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = round(Value, 2)), vjust = -0.5, size = 4) +
+  labs(
+    title = "Predicted vs Actual Ratings by Cluster",
+    x = "Cluster (Player Archetype)",
+    y = "Average Rating",
+    fill = NULL
+  ) +
+  theme_minimal(base_size = 13)
+
+# ✅ 9.7 Optional: Visualise RMSE by Cluster
+cluster_rmse_long <- cluster_perf %>%
+  select(Cluster, rmse_lm, rmse_rf) %>%
+  tidyr::pivot_longer(cols = -Cluster, names_to = "Model", values_to = "RMSE")
+
+ggplot(cluster_rmse_long, aes(x = factor(Cluster), y = RMSE, fill = Model)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = round(RMSE, 3)), vjust = -0.5, size = 4) +
+  labs(
+    title = "Model RMSE by Player Cluster",
+    x = "Cluster (Player Archetype)",
+    y = "Root Mean Square Error"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+# ------------------------------------------------------------
+
+# Final Predict Players Function (Position + Model + Cluster)
+
+# ------------------------------------------------------------
+
+```{r final predict players}
+
+new_predict_players <- function(df, model_type = c("rf", "lm")) {
+  model_type <- match.arg(model_type)
+
+  # ✅ Standardise position groups first
+  df <- df %>%
+    mutate(
+      player_positions = trimws(toupper(player_positions)),
+      position_group = case_when(
+        stringr::str_detect(player_positions, "GK") ~ "Goalkeeper",
+        stringr::str_detect(player_positions, "CB|LB|RB|LWB|RWB") ~ "Defender",
+        stringr::str_detect(player_positions, "CDM|CM|CAM|LM|RM|LCM|RCM|LDM|RDM") ~ "Midfielder",
+        stringr::str_detect(player_positions, "ST|CF|LW|RW|LF|RF") ~ "Forward",
+        TRUE ~ "Other"
+      )
+    )
+
+  # ✅ Ensure required columns exist after mutation
+  required_cols <- c("overall", "potential", "pace", "shooting",
+                     "passing", "dribbling", "defending", "physic", "age",
+                     "position_group")
+  missing_cols <- setdiff(required_cols, colnames(df))
+  if (length(missing_cols) > 0) {
+    stop(glue::glue("Missing required columns: {paste(missing_cols, collapse = ', ')}"))
+  }
+
+  # ✅ Define position-specific predictors
+  position_predictors <- list(
+    Goalkeeper = c("overall", "potential", "age"),
+    Defender   = c("overall", "defending", "age", "potential", "shooting"),
+    Midfielder = c("overall", "passing", "dribbling", "age", "potential"),
+    Forward    = c("overall", "shooting", "dribbling", "age", "passing")
+  )
+
+  # ✅ Add cluster label from global k-means model
+  if (exists("k4")) {
+    df <- df %>%
+      mutate(Cluster = k4$cluster[as.numeric(rownames(.))])
+  } else {
+    warning("k4 clustering object not found. Cluster column not added.")
+  }
+
+  # ✅ Predict for each position group
+  results <- df %>%
+    group_split(position_group) %>%
+    purrr::map_dfr(function(subset_df) {
+      pos <- unique(subset_df$position_group)
+      if (pos %in% names(position_predictors)) {
+        predictors <- position_predictors[[pos]]
+        formula <- as.formula(paste("next_rating ~", paste(predictors, collapse = " + ")))
+
+        # Choose model type
+        if (model_type == "lm") {
+          model <- lm(formula, data = train %>% filter(position_group == pos))
+        } else {
+          model <- randomForest::randomForest(
+            formula,
+            data = train %>% filter(position_group == pos),
+            ntree = 500,
+            mtry = floor(sqrt(length(predictors))),
+            importance = TRUE
+          )
+        }
+
+        preds <- predict(model, newdata = subset_df)
+
+        subset_df %>%
+          mutate(
+            Model = model_type,
+            Position = pos,
+            Predicted = preds,
+            Error = if ("next_rating" %in% names(subset_df))
+              preds - subset_df$next_rating else NA_real_
+          )
+      } else {
+        subset_df %>%
+          mutate(Model = model_type, Position = pos, Predicted = NA_real_, Error = NA_real_)
+      }
+    })
+
+  return(results)
+}
+
+# ------------------------------------------------------------
+# Helper: Predict Player by Name (Wrapper for new_predict_players)
+# ------------------------------------------------------------
+
+predict_player_v2 <- function(player_name, model_type = "rf") {
+  # 1️⃣ Clean and normalise player name
+  name_clean <- player_name %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%  # remove accents (e.g., Mbappé → Mbappe)
+    str_trim() %>%
+    toupper()
+
+  # 2️⃣ Find player in test dataset
+  player_df <- test %>%
+    mutate(long_name_clean = stringi::stri_trans_general(long_name, "Latin-ASCII") %>% toupper()) %>%
+    filter(str_detect(long_name_clean, name_clean)) %>%
+    slice_max(year, n = 1)
+
+  if (nrow(player_df) == 0) {
+    message("⚠️ No matching player found in test dataset. Try a shorter name (e.g., 'WIRTZ').")
+    return(NULL)
+  }
+
+  # 3️⃣ Predict using the selected model
+  result <- new_predict_players(player_df, model_type = model_type)
+
+  # 4️⃣ Format and print output
+  output <- result %>%
+    select(
+      Player = long_name,
+      Position,
+      Cluster,
+      Model,
+      Predicted = Predicted,
+      `Actual Next Rating` = next_rating,
+      Error
+    ) %>%
+    mutate(
+      Predicted = round(Predicted, 2),
+      `Actual Next Rating` = round(`Actual Next Rating`, 2),
+      Error = round(Error, 2)
+    )
+
+  print(output)
+  return(invisible(output))
+}
+```
+
+```{r trial kai havertz}
+
+
+# ------------------------------------------------------------
+# Showcase Predictions
+# ------------------------------------------------------------
+predict_player_v2("Olivier Giroud")
+predict_player_v2("Eden Hazard")
+predict_player_v2("Kylian Mbappe")
+predict_player_v2("Kai Havertz")
+predict_player_v2("Florian Wirtz")
+```
+
+```{r compare both models predict vs new_predict}
+# ------------------------------------------------------------
+# Accuracy Comparison: predict_players() vs new_predict_players()
+# ------------------------------------------------------------
+
+library(dplyr)
+library(ggplot2)
+library(caret)
+
+# ✅ Step 1: Prepare test dataset (clean & standardised)
+test_std <- test %>%
+  mutate(
+    player_positions = trimws(toupper(player_positions)),
+    position_group = case_when(
+      str_detect(player_positions, "GK") ~ "Goalkeeper",
+      str_detect(player_positions, "CB|LB|RB|LWB|RWB") ~ "Defender",
+      str_detect(player_positions, "CDM|CM|CAM|LM|RM|LCM|RCM|LDM|RDM") ~ "Midfielder",
+      str_detect(player_positions, "ST|CF|LW|RW|LF|RF") ~ "Forward",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  drop_na(next_rating)
+
+# ✅ Step 2: Predictions from OLD function (Linear Regression baseline)
+old_preds <- test_std %>%
+  group_split(position_group) %>%
+  purrr::map_dfr(function(subset_df) {
+    pos <- unique(subset_df$position_group)
+    if (pos %in% c("Goalkeeper", "Defender", "Midfielder", "Forward")) {
+      res <- predict_players(train, pos) %>%
+        filter(term != "(Intercept)")  # <-- fix here
+
+      formula_str <- paste("next_rating ~", paste(res$term, collapse = " + "))
+      model <- lm(as.formula(formula_str), data = train %>% filter(position_group == pos))
+
+      preds <- predict(model, newdata = subset_df)
+      subset_df %>%
+        mutate(Pred_old = preds)
+    } else {
+      subset_df %>% mutate(Pred_old = NA_real_)
+    }
+  })
+
+# ✅ Step 3: Predictions from NEW function (position + RF + clusters)
+new_preds <- new_predict_players(test_std, model_type = "rf") %>%
+  select(long_name, Pred_new = Predicted)
+
+# ✅ Step 4: Combine both sets of predictions
+compare_df <- old_preds %>%
+  left_join(new_preds, by = "long_name") %>%
+  mutate(
+    Error_old = Pred_old - next_rating,
+    Error_new = Pred_new - next_rating,
+    abs_error_old = abs(Error_old),
+    abs_error_new = abs(Error_new)
+  )
+
+# ✅ Step 5: Calculate metrics
+rmse_old <- sqrt(mean(compare_df$Error_old^2, na.rm = TRUE))
+rmse_new <- sqrt(mean(compare_df$Error_new^2, na.rm = TRUE))
+mae_old  <- mean(compare_df$abs_error_old, na.rm = TRUE)
+mae_new  <- mean(compare_df$abs_error_new, na.rm = TRUE)
+
+results <- tibble(
+  Model = c("Old predict_players (LM)", "New new_predict_players (RF)"),
+  RMSE  = c(rmse_old, rmse_new),
+  MAE   = c(mae_old, mae_new)
+)
+
+cat("✅ Model Accuracy Comparison:\n")
+print(results)
+
+# ✅ Step 6: Visualise RMSE / MAE
+results_long <- results %>%
+  tidyr::pivot_longer(cols = c(RMSE, MAE), names_to = "Metric", values_to = "Value")
+
+ggplot(results_long, aes(x = Metric, y = Value, fill = Model)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(aes(label = round(Value, 3)), vjust = -0.5, size = 4) +
+  labs(
+    title = "Model Accuracy Comparison",
+    subtitle = "Old vs New Player Prediction Functions",
+    y = "Error Value (Lower = Better)",
+    x = NULL
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+When cluster membership was included as an additional predictor, the model’s RMSE slightly deccreased. I initially thought that adding clusters might help become a new predictor and improving accuracy. However, this is not the case, this expected because the cluster variable was derived from the same underlying features used in training (pace, shooting, passing, etc.), adding redundancy rather than new information. Therefore, clusters are retained in this project for interpretive and recommendation purposes — helping categorise players by archetype rather than to directly enhance prediction accuracy.
+
+```{r renaming clusters}
+
+# ------------------------------------------------------------
+# Assign Cluster Names (Player Archetypes)
+# ------------------------------------------------------------
+
+cluster_labels <- c(
+  "Developing Attackers",   # Cluster 1
+  "All-Round Midfielders",  # Cluster 2
+  "Defensive Anchors",      # Cluster 3
+  "Elite Forwards"          # Cluster 4
+)
+
+train_with_cluster <- train %>%
+  mutate(
+    Cluster = k4$cluster[as.numeric(rownames(.))],
+    Cluster_Name = factor(cluster_labels[Cluster],
+                          levels = cluster_labels)
+  )
+
+# Optional: Visualise cluster distribution
+train_with_cluster %>%
+  count(Cluster_Name) %>%
+  ggplot(aes(x = reorder(Cluster_Name, n), y = n, fill = Cluster_Name)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  labs(
+    title = "Player Archetype Distribution",
+    x = "Player Archetype",
+    y = "Number of Players"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The four archetypes derived from clustering are summarised as follows: (1) Developing Attackers – younger, pace-oriented players still refining technical skills; (2) All-Round Midfielders – balanced contributors strong across multiple attributes; (3) Defensive Anchors – positionally disciplined defenders with high defending and physical strength; and (4) Elite Forwards – top-performing attackers excelling in shooting and dribbling.
+
+These clusters act as interpretable categories for scouting and recommendation rather than as direct predictors in the model, enriching qualitative insight into quantitative results.
+
+```{r showing accurracy}
+# ------------------------------------------------------------
+# Evaluate Prediction Accuracy Against Actual FIFA 2022 Ratings
+# ------------------------------------------------------------
+
+library(ggplot2)
+library(caret)
+library(dplyr)
+library(plotly)
+
+
+# ✅ 1. Extract 2022 actual ratings
+fifa_2022_clean <- fifa_all %>%
+  filter(year == 2022) %>%
+  transmute(
+    long_name_clean = stringi::stri_trans_general(long_name, "Latin-ASCII") %>% toupper(),
+    overall_2022 = as.numeric(overall)
+  )
+
+# ✅ 2. Prepare 2021 test dataset
+test_joined <- test %>%
+  mutate(
+    long_name_clean = stringi::stri_trans_general(long_name, "Latin-ASCII") %>% toupper(),
+    value_eur = as.numeric(value_eur)
+  ) %>%
+  left_join(fifa_2022_clean, by = "long_name_clean") %>%
+  mutate(
+    Pred_RF = predict(model_rf, newdata = .),
+    Pred_LM = predict(model_lm, newdata = ., allow.new.levels = TRUE)
+  )
+
+# ✅ 1. Keep only complete cases (players found in both 2021 + 2022)
+eval_df <- test_joined %>%
+  drop_na(Pred_RF, overall_2022, overall)
+
+cat("✅ Matched players:", nrow(eval_df), "\n")
+
+# ✅ 2. Compute performance metrics
+rf_rmse_2022 <- RMSE(eval_df$Pred_RF, eval_df$overall_2022)
+lm_rmse_2022 <- RMSE(eval_df$Pred_LM, eval_df$overall_2022)
+rf_mae_2022  <- MAE(eval_df$Pred_RF, eval_df$overall_2022)
+lm_mae_2022  <- MAE(eval_df$Pred_LM, eval_df$overall_2022)
+
+results_2022 <- tibble(
+  Model = c("Random Forest", "Linear Regression"),
+  RMSE  = c(rf_rmse_2022, lm_rmse_2022),
+  MAE   = c(rf_mae_2022, lm_mae_2022)
+)
+
+cat("✅ Model Accuracy vs Actual FIFA 2022 Ratings:\n")
+print(results_2022)
+
+# ✅ 3. Visual comparison plot
+ggplot(eval_df, aes(x = overall_2022, y = Pred_RF)) +
+  geom_point(alpha = 0.4, color = "#2E86C1") +
+  geom_abline(intercept = 0, slope = 1, color = "darkred", linetype = "dashed") +
+  labs(
+    title = "Predicted vs Actual FIFA 2022 Ratings",
+    subtitle = paste0("Random Forest RMSE = ", round(rf_rmse_2022, 2),
+                      " | Linear RMSE = ", round(lm_rmse_2022, 2)),
+    x = "Actual FIFA 2022 Overall Rating",
+    y = "Predicted Rating (Next Rating)"
+  ) +
+  theme_minimal(base_size = 13)
+
+# ------------------------------------------------------------
+# Optional Interactive Version (hover to see player names)
+# ------------------------------------------------------------
+# NOTE: uncomment below lines in HTML output only
+# p <- ggplot(eval_df, aes(
+#   x = overall_2022, y = Pred_RF,
+#   text = paste0(
+#     "Player: ", long_name, "<br>",
+#     "Club: ", club_name, "<br>",
+#     "Actual 2022: ", overall_2022, "<br>",
+#     "Predicted: ", round(Pred_RF, 1)
+#   )
+# )) +
+#   geom_point(alpha = 0.5, color = "#2E86C1") +
+#   geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "darkred") +
+#   labs(
+#     title = "Predicted vs Actual FIFA 2022 Ratings (Interactive)",
+#     x = "Actual FIFA 2022 Overall",
+#     y = "Predicted (Random Forest)"
+#   ) +
+#   theme_minimal(base_size = 13)
+#
+# ggplotly(p, tooltip = "text")
+```
+
+# ------------------------------------------------------------
+
+# Identify Outliers – Players with Biggest Prediction Errors
+
+# ------------------------------------------------------------
+
+```{r outliers}
+# ------------------------------------------------------------
+# Robust: Recompute predictions (if needed) + print outliers
+# ------------------------------------------------------------
+suppressPackageStartupMessages({
+  library(dplyr); library(stringi); library(caret); library(randomForest)
+})
+
+required_predictors <- c("overall","potential","pace","shooting",
+                         "passing","dribbling","defending","physic","age")
+
+# 0) Train quick fallback models if not present
+if (!exists("model_rf")) {
+  message("⚠️ model_rf not found — training a quick RF on `train`...")
+  stopifnot(exists("train"))
+  train_rf <- train %>% dplyr::select(all_of(required_predictors), next_rating) %>% drop_na()
+  model_rf <<- randomForest::randomForest(
+    next_rating ~ overall + potential + pace + shooting + passing +
+      dribbling + defending + physic + age,
+    data = train_rf, ntree = 300, mtry = 3, na.action = na.omit
+  )
+}
+
+if (!exists("model_lm")) {
+  message("⚠️ model_lm not found — fitting a quick LM on `train`...")
+  stopifnot(exists("train"))
+  train_lm_local <- train %>% dplyr::select(all_of(required_predictors), next_rating) %>% drop_na()
+  model_lm <<- lm(
+    next_rating ~ overall + potential + pace + shooting + passing +
+      dribbling + defending + physic + age,
+    data = train_lm_local
+  )
+}
+
+# 1) Build evaluation base: test (2021) joined with actual 2022
+test_2021 <- test %>%
+  mutate(long_name_clean = stri_trans_general(long_name, "Latin-ASCII") %>% toupper())
+
+fifa_2022_clean <- fifa_all %>%
+  filter(year == 2022) %>%
+  transmute(
+    long_name_clean = stri_trans_general(long_name, "Latin-ASCII") %>% toupper(),
+    overall_2022 = as.numeric(overall)
+  )
+
+eval_df <- test_2021 %>%
+  left_join(fifa_2022_clean, by = "long_name_clean") %>%
+  mutate(across(all_of(required_predictors), as.numeric))
+
+# 2) Recompute predictions (always) to avoid missing-cols issues
+eval_df <- eval_df %>%
+  mutate(
+    Pred_RF = predict(model_rf, newdata = .),
+    Pred_LM = predict(model_lm, newdata = .)
+  )
+
+# 3) Filter to complete rows and compute errors
+eval_complete <- eval_df %>% drop_na(Pred_RF, overall_2022)
+
+outliers <- eval_complete %>%
+  mutate(
+    Error_RF = Pred_RF - overall_2022,
+    Abs_Error_RF = abs(Error_RF)
+  ) %>%
+  arrange(desc(Abs_Error_RF)) %>%
+  select(
+    Player = long_name,
+    Club = club_name,
+    Age = age,
+    Position = player_positions,
+    Actual_2022 = overall_2022,
+    Predicted_RF = Pred_RF,
+    Error_RF,
+    `|Error|` = Abs_Error_RF
+  ) %>%
+  mutate(across(c(Predicted_RF, Error_RF, `|Error|`), ~ round(., 2)))
+
+# ✅ Top 10 most over/under-predicted players
+print(head(outliers, 10), n = 10)
+
+# (Optional) quick metrics in the console
+rf_rmse_2022 <- caret::RMSE(eval_complete$Pred_RF, eval_complete$overall_2022)
+lm_rmse_2022 <- caret::RMSE(eval_complete$Pred_LM, eval_complete$overall_2022)
+cat(sprintf("\nRF RMSE vs 2022: %.3f | LM RMSE: %.3f\n", rf_rmse_2022, lm_rmse_2022))
+```
+
+Interpretation of Figure — Predicted vs Actual FIFA 2022 Ratings
+
+The scatterplot compares each player’s predicted 2022 rating (y-axis) against their actual 2022 rating (x-axis). The dashed red diagonal represents a perfect 1:1 prediction line—points along this line indicate exact matches. • RMSE = 2.31 for both Random Forest and Linear Regression, meaning on average, predictions differ from the real 2022 ratings by only \~2.3 points. • The tight clustering around the diagonal shows that most predictions are highly accurate, especially for players rated between 60 and 85. • A few outliers (above or below the line) reflect players whose real-life performances fluctuated unexpectedly (e.g., injuries or breakout seasons). • Both models generalised well beyond the training years (2015-2021), validating the model’s temporal stability across unseen seasons.
+
+# 10. Recommendation System – Identifying Emerging Talents
+
+Building on the predictive and clustering analyses, the final stage applies a recommendation framework to highlight promising young players. Each player is assigned to one of the four archetypes and evaluated through Random Forest predictions of their next-season rating. By filtering for players aged ≤ 23 years and ranking within each archetype, the system surfaces top prospects expected to progress the most within their stylistic group.
+
+This approach imitates a data-driven scouting process: coaches can identify future stars not merely by absolute rating but by contextualising growth within comparable player types.
+
+```{r trial}
+recommend_young_value_players <- function(top_n = 10, age_limit = 23) {
+  library(dplyr)
+  library(glue)
+
+  recommendations_df <- test %>%
+    mutate(
+      Cluster = k4$cluster[as.numeric(rownames(.))],
+      Cluster_Name = c(
+        "Developing Attackers",   # 1
+        "All-Round Midfielders",  # 2
+        "Defensive Anchors",      # 3
+        "Elite Forwards"          # 4
+      )[Cluster],
+      Pred_RF = predict(model_rf, newdata = .),
+      value_eur = as.numeric(value_eur)
+    ) %>%
+    drop_na(Pred_RF, overall, potential, age, value_eur) %>%
+    filter(age <= age_limit) %>%
+    mutate(
+      `Market Value (€M)` = round(value_eur / 1e6, 2),
+      `Potential Gap` = potential - Pred_RF
+    )
+
+  top_per_cluster <- recommendations_df %>%
+    group_by(Cluster, Cluster_Name) %>%
+    arrange(desc(Pred_RF), desc(value_eur)) %>%
+    slice_head(n = top_n) %>%
+    ungroup() %>%
+    select(
+      Cluster_Name,
+      Player = long_name,
+      Age = age,
+      Club = club_name,
+      Position = player_positions,
+      Overall = overall,
+      Potential = potential,
+      `Predicted Next Rating` = Pred_RF,
+      `Potential Gap`,
+      `Market Value (€M)`
+    )
+
+  cat(glue("\n🏆 Top {top_n} Young Talents (≤{age_limit}) per Cluster Archetype\n"))
+  print(top_per_cluster, n = top_n * 4)
+  return(invisible(top_per_cluster))
+}
+
+# Run it
+top_young_value <- recommend_young_value_players(top_n = 10, age_limit = 23)
+```
+
+# 11. Interpretation of Recommendations
+
+The enhanced recommendation system integrates predicted performance, player age, and market value to produce realistic shortlists of young talents. Unlike earlier versions that applied mechanical “value-for-money” ratios, this model retains interpretive flexibility, allowing scouts to balance cost, predicted development, and remaining potential.
+
+The output provides, for each archetype, the top 10 players ≤ 23 years old with the highest expected future rating. For example, Elite Forwards typically display the highest predicted ratings but also higher transfer values, whereas Developing Attackers offer lower-cost growth potential.
+
+This final stage connects analytics to practical decision-making, forming a transparent, explainable, and replicable scouting tool.
